@@ -6,9 +6,11 @@ import shutil
 import tempfile
 import argparse
 import os
+import sys
 import posixpath
 import urllib.parse
 import re
+from multiprocessing import RawValue, Lock
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -17,11 +19,27 @@ def is_url(uri):
     return re.match(r'https?://', uri) is not None
 
 
+class Counter(object):
+    def __init__(self, value=0):
+        self.val = RawValue('i', value)
+        self.lock = Lock()
+
+    def increment(self):
+        with self.lock:
+            self.val.value += 1
+
+    def value(self):
+        with self.lock:
+            return self.val.value
+
+
 class DownloadSegment(threading.Thread):
-    def __init__(self, downloadqueue, location):
+    def __init__(self, downloadqueue, location, counter, total):
         threading.Thread.__init__(self)
         self.downloadQueue = downloadqueue
         self.location = location
+        self.counter = counter
+        self.total = total
 
     def run(self):
         while True:
@@ -29,6 +47,9 @@ class DownloadSegment(threading.Thread):
             if item is None:
                 break
             self.execute(item)
+            self.counter.increment()
+            print(" {0:.2f}%".format((self.counter.value()/self.total)*100), end='\r')
+            sys.stdout.flush()
             self.downloadQueue.task_done()
 
     def execute(self, item):
@@ -94,12 +115,14 @@ def hls_fetch(playlist_location, storage_location, name="video.ts", threads=5):
         base_path = posixpath.normpath(parsed_url.path + '/..')
         base_uri = urllib.parse.urljoin(prefix, base_path)
         pool = list()
+        thread_safe_counter = Counter()
+        total = len(playlist.segments)
         for number, file in enumerate(playlist.segments):
             if not is_url(file.uri):
                 playlist.base_uri = base_uri
             download_queue.put([number, playlist.base_uri, file.uri, file.key])
         for i in range(num_worker_threads):
-            thread = DownloadSegment(download_queue, download_location)
+            thread = DownloadSegment(download_queue, download_location, thread_safe_counter, total)
             thread.daemon = True
             thread.start()
             pool.append(thread)
