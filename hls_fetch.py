@@ -1,5 +1,3 @@
-import threading
-import queue
 import m3u8
 import requests
 import shutil
@@ -10,7 +8,9 @@ import sys
 import posixpath
 import urllib.parse
 import re
-from multiprocessing import RawValue, Lock
+from multiprocessing import Lock
+from multiprocessing.sharedctypes import RawValue
+import concurrent.futures
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -31,47 +31,6 @@ class Counter(object):
     def value(self):
         with self.lock:
             return self.val.value
-
-
-class DownloadSegment(threading.Thread):
-    def __init__(self, downloadqueue, location, counter, total):
-        threading.Thread.__init__(self)
-        self.downloadQueue = downloadqueue
-        self.location = location
-        self.counter = counter
-        self.total = total
-
-    def run(self):
-        while True:
-            item = self.downloadQueue.get()
-            if item is None:
-                break
-            self.execute(item)
-            self.counter.increment()
-            print(" {0:.2f}%".format((self.counter.value()/self.total)*100), end='\r')
-            sys.stdout.flush()
-            self.downloadQueue.task_done()
-
-    def execute(self, item):
-        if item[1]:
-            url = item[1] + "/" + item[2]
-        else:
-            url = item[2]
-            item[2] = os.path.basename(urllib.parse.urlparse(url).path)
-        if item[3]:
-            backend = default_backend()
-            r = requests.get(item[3].uri)
-            key = r.content
-            cipher = Cipher(algorithms.AES(key), modes.CBC(bytes.fromhex(item[3].iv[2:])), backend=backend)
-            decryptor = cipher.decryptor()
-        r = requests.get(url, stream=True)
-        with open(os.path.join(self.location, item[2]), 'wb') as f:
-            for chunk in r.iter_content(chunk_size=1024):
-                if chunk:
-                    if item[3]:
-                        f.write(decryptor.update(chunk))
-                    else:
-                        f.write(chunk)
 
 
 def highest_bandwidth(m3u8_obj, location):
@@ -103,10 +62,35 @@ def m3u8_load(uri):
     return m3u8_obj
 
 
+def download_file(download_location, remote_file, base_uri, m3u8_playlist, counter, total):
+    if not is_url(remote_file.uri):
+        m3u8_playlist.base_uri = base_uri
+    if m3u8_playlist.base_uri:
+        url = m3u8_playlist.base_uri + "/" + remote_file.uri
+    else:
+        url = remote_file.uri
+    filename = os.path.basename(urllib.parse.urlparse(url).path)
+    if remote_file.key:
+        backend = default_backend()
+        r = requests.get(remote_file.key.uri)
+        key = r.content
+        cipher = Cipher(algorithms.AES(key), modes.CBC(bytes.fromhex(remote_file.key.iv[2:])), backend=backend)
+        decrypter = cipher.decryptor()
+    r = requests.get(url, stream=True)
+    with open(os.path.join(download_location, filename), 'wb') as f:
+        for chunk in r.iter_content(chunk_size=1024):
+            if chunk:
+                if remote_file.key:
+                    f.write(decrypter.update(chunk))
+                else:
+                    f.write(chunk)
+    counter.increment()
+    print(" {0:.2f}%".format((counter.value() / total) * 100), end='\r')
+    sys.stdout.flush()
+
+
 def hls_fetch(playlist_location, storage_location, name="video.ts", threads=5):
-    download_queue = queue.Queue()
     with tempfile.TemporaryDirectory() as download_location:
-        num_worker_threads = threads
         playlist = m3u8_load(playlist_location)
         high_bw = highest_bandwidth(playlist, playlist_location)
         playlist = m3u8_load(high_bw.absolute_uri)
@@ -114,23 +98,17 @@ def hls_fetch(playlist_location, storage_location, name="video.ts", threads=5):
         prefix = parsed_url.scheme + '://' + parsed_url.netloc
         base_path = posixpath.normpath(parsed_url.path + '/..')
         base_uri = urllib.parse.urljoin(prefix, base_path)
-        pool = list()
         thread_safe_counter = Counter()
         total = len(playlist.segments)
-        for number, file in enumerate(playlist.segments):
-            if not is_url(file.uri):
-                playlist.base_uri = base_uri
-            download_queue.put([number, playlist.base_uri, file.uri, file.key])
-        for i in range(num_worker_threads):
-            thread = DownloadSegment(download_queue, download_location, thread_safe_counter, total)
-            thread.daemon = True
-            thread.start()
-            pool.append(thread)
-        download_queue.join()
-        for i in range(num_worker_threads):
-            download_queue.put(None)
-        for thread in pool:
-            thread.join()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = [executor.submit(download_file, download_location, file, base_uri, playlist,
+                                       thread_safe_counter, total)
+                       for file in playlist.segments]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except:
+                    exit(900)
         merge_files(playlist.segments, download_location, storage_location, name)
 
 
